@@ -1,0 +1,102 @@
+# REFERENCE ONLY – not executed in this training.
+# In a real repo this file lives at the repo root as  azure-pipelines.yml
+#
+#   pull request -> main :  CI stage  = unit tests + "databricks bundle validate"
+#   merge to main        :  CI stage, then CD stage = "databricks bundle deploy -t prod" (+ smoke run)
+#
+# Authentication: Azure Resource Manager service connection with workload identity federation
+# (no secret). The Databricks CLI picks up the Azure CLI login inside AzureCLI@2.
+# One-time setup:
+#   1. Project settings -> Service connections -> New -> Azure Resource Manager ->
+#      Workload identity federation. Names used below: sc-databricks-ci, sc-databricks-prod.
+#   2. Add the service principal of each connection to the Databricks workspace
+#      (Settings -> Identity and access -> Service principals) with the rights it needs.
+#   3. Pipelines -> Environments -> "databricks-prod" -> Approvals and checks -> Approvals
+#      = manual approval gate before every prod deploy.
+#   4. Azure Repos: PR runs come from a branch policy (main -> Build validation -> this pipeline);
+#      the "pr:" block below only applies to GitHub / Bitbucket repos.
+#   5. In databricks.yml, the prod target of a real project would use
+#        run_as: { service_principal_name: <prod SP application ID> }
+#      and a root_path such as /Workspace/Shared/.bundle/${bundle.name}/prod
+#
+# Docs: https://learn.microsoft.com/azure/databricks/dev-tools/auth/auth-with-azure-devops
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  BUNDLE_DIR: bundle                                              # folder that contains databricks.yml
+  DATABRICKS_HOST: https://adb-<workspace-id>.<n>.azuredatabricks.net
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: CI
+    displayName: CI - unit tests + bundle validate
+    jobs:
+      - job: test_and_validate
+        steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.12"
+
+          - script: |
+              pip install pytest
+              pytest
+            workingDirectory: $(BUNDLE_DIR)
+            displayName: Unit tests (no Databricks needed)
+
+          - script: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+            displayName: Install Databricks CLI          # real life: replace main with a version tag
+
+          - task: AzureCLI@2
+            displayName: Validate bundle for every target
+            inputs:
+              azureSubscription: sc-databricks-ci
+              useGlobalConfig: true
+              scriptType: bash
+              scriptLocation: inlineScript
+              workingDirectory: $(BUNDLE_DIR)
+              inlineScript: |
+                export DATABRICKS_HOST=$(DATABRICKS_HOST)
+                databricks bundle validate -t dev
+                databricks bundle validate -t prod
+
+  - stage: CD
+    displayName: CD - deploy to prod
+    dependsOn: CI
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: deploy_prod
+        environment: databricks-prod          # approvals are configured on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self              # deployment jobs do not check out automatically
+
+                - script: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+                  displayName: Install Databricks CLI
+
+                - task: AzureCLI@2
+                  displayName: Deploy to prod + smoke run
+                  inputs:
+                    azureSubscription: sc-databricks-prod
+                    useGlobalConfig: true
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    workingDirectory: $(BUNDLE_DIR)
+                    inlineScript: |
+                      export DATABRICKS_HOST=$(DATABRICKS_HOST)
+                      databricks bundle deploy -t prod
+                      databricks bundle run -t prod cicd_lab_job

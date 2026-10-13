@@ -1,0 +1,49 @@
+# The job: bronze -> silver -> gold, on serverless compute.
+# No cluster settings anywhere = serverless.
+# Paths are relative to THIS file (resources/) -> ../src/...
+
+resources:
+  jobs:
+    cicd_lab_job:
+      name: cicd_lab_job
+      description: Danube Goods mini medallion (CI/CD lab)
+      max_concurrent_runs: 1
+
+      tags:
+        course: cicd_lab_simple
+
+      # Pushed to every task, arrive in the notebooks as widgets.
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+
+      # Daily at 06:00. dev: paused automatically (mode: development). prod: active.
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: Europe/Berlin
+
+      tasks:
+        - task_key: bronze
+          notebook_task:
+            notebook_path: ../src/01_bronze.py
+
+        - task_key: silver
+          depends_on:
+            - task_key: bronze
+          notebook_task:
+            notebook_path: ../src/02_silver.py
+
+        - task_key: gold
+          depends_on:
+            - task_key: silver
+          notebook_task:
+            notebook_path: ../src/03_gold.py
+
+        # Added in lab step 3: fail the run if the data looks wrong
+        - task_key: quality_check
+          depends_on:
+            - task_key: gold
+          notebook_task:
+            notebook_path: ../src/04_quality_check.py

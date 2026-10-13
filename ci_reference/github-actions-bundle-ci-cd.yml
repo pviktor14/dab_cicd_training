@@ -1,0 +1,89 @@
+# REFERENCE ONLY – not executed in this training.
+# In a real repo this file lives at  .github/workflows/bundle-ci-cd.yml
+#
+#   pull request -> main :  CI  = unit tests + "databricks bundle validate"
+#   merge (push) to main :  CI again, then CD = "databricks bundle deploy -t prod" (+ smoke run)
+#
+# Authentication: workload identity federation (OIDC) – no Databricks secret stored in GitHub.
+# One-time setup (per environment, e.g. "dev" for CI and "prod" for CD):
+#   1. Create a Databricks service principal (one for CI, one for prod is good practice).
+#   2. Add a GitHub Actions federation policy to it, subject e.g.
+#        repo:<org>/<repo>:environment:prod
+#      https://learn.microsoft.com/azure/databricks/dev-tools/auth/provider-github
+#   3. GitHub repo -> Settings -> Environments -> "dev" and "prod":
+#        variable DATABRICKS_HOST       = https://adb-<workspace-id>.<n>.azuredatabricks.net
+#        secret   DATABRICKS_CLIENT_ID  = the service principal's application (client) ID
+#      On "prod" add "Required reviewers" = manual approval gate before every prod deploy.
+#   4. In databricks.yml, the prod target of a real project would use
+#        run_as: { service_principal_name: <prod SP application ID> }
+#      and a root_path such as /Workspace/Shared/.bundle/${bundle.name}/prod
+#      (no per-user name_prefix – there is only one prod).
+
+name: bundle-ci-cd
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC token exchange
+  contents: read
+
+jobs:
+  ci:
+    name: CI - unit tests + bundle validate
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+    defaults:
+      run:
+        working-directory: bundle        # folder that contains databricks.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unit tests (no Databricks needed)
+        run: |
+          pip install pytest
+          pytest
+
+      - uses: databricks/setup-cli@main    # real life: pin a release tag instead of @main
+
+      - name: Validate bundle for every target
+        run: |
+          databricks bundle validate -t dev
+          databricks bundle validate -t prod
+
+  cd:
+    name: CD - deploy to prod
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: prod                    # approval gate + prod SP credentials
+    concurrency: prod-deploy             # never two prod deploys at the same time
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+    defaults:
+      run:
+        working-directory: bundle
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: databricks/setup-cli@main
+
+      - name: Deploy to prod
+        run: databricks bundle deploy -t prod
+
+      - name: Smoke test - run the job once and wait for the result
+        run: databricks bundle run -t prod cicd_lab_job
